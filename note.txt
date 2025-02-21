@@ -1,0 +1,5 @@
+'ffmpeg -y -i colDataPath/col.mp4 -qscale:v 2 -threads 10 -async 1 -r 25 colDataPath/col/pyavi/video.avi -loglevel panic'
+
+'ffmpeg -y -i colDataPath/col/pyavi/video.avi -qscale:a 0 -ac 1 -vn -threads 10 -ar 16000 colDataPath/col/pyavi/audio.wav -loglevel panic'
+
+'ffmpeg -y -i colDataPath/col/pyavi/video.avi -qscale:v 2 -threads 10 -f image2 colDataPath/col/pyframes/%06d.jpg -loglevel panic'
