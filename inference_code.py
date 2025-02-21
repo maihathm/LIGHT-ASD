@@ -112,8 +112,11 @@ def group_segments(labels, min_length=2, gap_threshold=10):
     logging.debug(f"Grouped speech segments: {segments}")
     return segments
 
-def extract_speech_segments(video_frames: np.ndarray, audio: np.ndarray, labels, fps, audio_sr):
-    """Tách đoạn nói từ video và audio dựa trên nhãn."""
+def extract_speech_segments(video_frames: np.ndarray, audio: np.ndarray, labels, fps, audio_sr, merge=True):
+    """Tách đoạn nói từ video và audio dựa trên nhãn.
+    
+    Nếu merge=True thì nối các đoạn nói lại, ngược lại trả về danh sách các đoạn.
+    """
     segments = group_segments(labels)
     if not segments:
         logging.warning("Không có segment nào được xác định từ labels.")
@@ -129,17 +132,19 @@ def extract_speech_segments(video_frames: np.ndarray, audio: np.ndarray, labels,
         end_sample = int(end_time * audio_sr)
         audio_seg = audio[start_sample:end_sample]
         audio_segments.append(audio_seg)
-    video_concat = np.concatenate(video_segments, axis=0)
-    audio_concat = np.concatenate(audio_segments, axis=0)
-    logging.debug(f"Extracted speech segments: video shape {video_concat.shape}, audio shape {audio_concat.shape}")
-    return video_concat, audio_concat
+    if merge:
+        video_concat = np.concatenate(video_segments, axis=0)
+        audio_concat = np.concatenate(audio_segments, axis=0)
+        return video_concat, audio_concat
+    else:
+        return video_segments, audio_segments
 
-def process_file(video_path, audio_path, sentence, output_dir, asd_model, face_detector, device):
+
+def process_file(video_path, audio_path, sentence, output_dir, asd_model, face_detector, device, output_mode="merged"):
     try:
         logging.info(f"Processing file: {video_path}")
         read_result = torchvision.io.read_video(video_path, pts_unit='sec')
         video_tensor = read_result[0]
-        video_audio = read_result[1] if len(read_result) > 2 else None
         info = read_result[-1]
         fps = info.get('video_fps', 30)
         num_frames = video_tensor.shape[0]
@@ -164,7 +169,6 @@ def process_file(video_path, audio_path, sentence, output_dir, asd_model, face_d
             return None
 
         # Điều chỉnh kích thước tensor cho input của model.
-        # NOTE: tensor_video trả về shape (N, 112, 112) -> unsqueeze để có shape (1, N, 112, 112)
         audio_tensor = audio_tensor.unsqueeze(0).to(device)   # [1, T, 13]
         face_tensor = face_tensor.unsqueeze(0).to(device)       # [1, N, 112, 112]
         logging.debug(f"Audio tensor shape: {audio_tensor.shape}, Face tensor shape: {face_tensor.shape}")
@@ -185,29 +189,59 @@ def process_file(video_path, audio_path, sentence, output_dir, asd_model, face_d
         pred_np = pred.cpu().numpy().flatten()
         logging.debug(f"Prediction shape: {pred_np.shape}, unique labels: {np.unique(pred_np)}")
         video_np = video_tensor.cpu().numpy()
-        video_segments, audio_segments = extract_speech_segments(video_np, audio_data, pred_np, fps, sr)
-        if video_segments is None:
-            logging.warning(f"Không phát hiện được đoạn nói trong {video_path}")
+
+        if output_mode == "merged":
+            video_segments, audio_segments = extract_speech_segments(video_np, audio_data, pred_np, fps, sr, merge=True)
+            if video_segments is None:
+                logging.warning(f"Không phát hiện được đoạn nói trong {video_path}")
+                return None
+
+            if audio_segments.ndim == 1:
+                audio_segments = audio_segments.reshape(-1, 1)
+                logging.debug(f"Reshaped audio_segments to {audio_segments.shape}")
+
+            out_video_path = os.path.join(output_dir, os.path.basename(video_path))
+            video_out_tensor = torch.from_numpy(video_segments.astype(np.uint8))
+            audio_out_tensor = torch.from_numpy(audio_segments.astype(np.float32))
+            # Chuyển vị audio: từ (n_samples, 1) thành (1, n_samples)
+            audio_array = audio_out_tensor.numpy().T
+            logging.debug(f"Writing merged video to {out_video_path}")
+            torchvision.io.write_video(
+                out_video_path, 
+                video_out_tensor, 
+                fps=30,
+                audio_array=audio_array, 
+                audio_fps=sr,
+                video_codec="libx264", 
+                audio_codec="aac"
+            )
+        elif output_mode == "separate":
+            video_segments_list, audio_segments_list = extract_speech_segments(video_np, audio_data, pred_np, fps, sr, merge=False)
+            if video_segments_list is None or len(video_segments_list) == 0:
+                logging.warning(f"Không phát hiện được đoạn nói trong {video_path}")
+                return None
+            base_name, ext = os.path.splitext(os.path.basename(video_path))
+            for idx, (vid_seg, aud_seg) in enumerate(zip(video_segments_list, audio_segments_list), start=1):
+                # Đảm bảo aud_seg có shape (n_samples, 1)
+                if aud_seg.ndim == 1:
+                    aud_seg = aud_seg.reshape(-1, 1)
+                out_video_path = os.path.join(output_dir, f"{base_name}_{idx}{ext}")
+                video_out_tensor = torch.from_numpy(vid_seg.astype(np.uint8))
+                audio_out_tensor = torch.from_numpy(aud_seg.astype(np.float32))
+                audio_array = audio_out_tensor.numpy().T
+                logging.debug(f"Writing segment {idx} video to {out_video_path}")
+                torchvision.io.write_video(
+                    out_video_path, 
+                    video_out_tensor, 
+                    fps=30,
+                    audio_array=audio_array, 
+                    audio_fps=sr,
+                    video_codec="libx264", 
+                    audio_codec="aac"
+                )
+        else:
+            logging.error(f"Output mode '{output_mode}' không hợp lệ. Chọn 'merged' hoặc 'separate'.")
             return None
-
-        if audio_segments.ndim == 1:
-            audio_segments = audio_segments.reshape(-1, 1)
-            logging.debug(f"Reshaped audio_segments to {audio_segments.shape}")
-
-        out_video_path = os.path.join(output_dir, os.path.basename(video_path))
-        video_out_tensor = torch.from_numpy(video_segments.astype(np.uint8))
-        audio_out_tensor = torch.from_numpy(audio_segments.astype(np.float32))
-        audio_array = audio_out_tensor.numpy().T
-        logging.debug(f"Writing video to {out_video_path}")
-        torchvision.io.write_video(
-            out_video_path, 
-            video_out_tensor, 
-            fps=30,
-            audio_array=audio_array, 
-            audio_fps=sr,
-            video_codec="libx264", 
-            audio_codec="aac"
-        )
 
         if EVAL_INFERENCE:
             logging.info(f"Inference: {inference_time:.2f}s, Frames: {num_frames}")
@@ -216,8 +250,8 @@ def process_file(video_path, audio_path, sentence, output_dir, asd_model, face_d
 
     except Exception as e:
         logging.exception(f"Error processing {video_path}: {str(e)}")
-        logging.debug(traceback.format_exc())
         return None
+
 
 def main():
     input_csv = "data.csv"
@@ -234,6 +268,9 @@ def main():
     df = pd.read_csv(input_csv)
     output_rows = []
     start_time = datetime.now()
+    # Chọn output_mode: "merged" hoặc "separate"
+    output_mode = "separate"  # hoặc "merged"
+
     for idx, row in tqdm(df.iterrows(), total=len(df), desc="Processing videos"):
         video_path = str(row["video_path"]).strip()
         audio_path = str(row["audio_path"]).strip()
